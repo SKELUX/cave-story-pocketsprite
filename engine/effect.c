@@ -1,0 +1,936 @@
+#include "common.h"
+
+#include "camera.h"
+#include "md/dma.h"
+#include "entity.h"
+#include "math.h"
+#include "md/stdlib.h"
+#include "player.h"
+#include "resources.h"
+#include "res/tiles.h"
+#include "sheet.h"
+#include "tables.h"
+#include "md/comp.h"
+#include "md/vdp.h"
+#include "md/sys.h"
+#include "system.h"
+#include "hud.h"
+#include "stage.h"
+#include "gamemode.h"
+
+#include "effect.h"
+
+static Effect effDamage[MAX_DAMAGE], effMisc[MAX_MISC];
+static struct {
+	Entity *e;
+	int16_t xoff, yoff;
+} damageFollow[MAX_DAMAGE];
+
+// Create a memory buffer of 4 tiles containing a string like "+3" or "-127"
+// Then copy to VRAM via DMA transfer
+uint32_t dtiles[MAX_DAMAGE][4][8];
+uint8_t digitCount[MAX_DAMAGE];
+uint8_t dqueued;
+
+int8_t wipeFadeTimer;
+int8_t wipeFadeOutTimer;
+uint8_t wipeFadeDir;
+
+typedef struct ClipOut {
+	uint16_t addr;
+	uint8_t line_len;
+	uint8_t spr_height;
+	uint8_t spr_remain;
+	uint8_t y_remain;
+	uint8_t speed;
+	uint8_t timer;
+} ClipOut;
+
+typedef struct ClipIn {
+	const uint32_t *tile_dat;
+	uint16_t to_addr;
+	uint8_t line_len;
+	uint8_t spr_height;
+	uint8_t spr_remain;
+	uint8_t y_remain;
+	uint8_t speed;
+	uint8_t timer;
+} ClipIn;
+
+static ClipOut s_clipout[2];
+static ClipIn s_clipin;
+
+void effects_init(void) {
+	wipeFadeTimer = -1;
+	wipeFadeOutTimer = -1;
+	for(uint8_t i = 0; i < MAX_DAMAGE; i++) effDamage[i].ttl = 0;
+	for(uint8_t i = 0; i < MAX_MISC; i++) effMisc[i].ttl = 0;
+	effects_reload_tiles();
+	s_clipin.y_remain = 0;
+	s_clipout[0].y_remain = 0;
+	s_clipout[1].y_remain = 0;
+}
+
+void effects_clear(void) {
+	for(uint8_t i = 0; i < MAX_DAMAGE; i++) effDamage[i].ttl = 0;
+	for(uint8_t i = 0; i < MAX_MISC; i++) effMisc[i].ttl = 0;
+}
+
+void effects_reload_tiles(void) {
+	SHEET_LOAD(&SPR_Bonk, 1, 1, 1, 1, 0);
+	SHEET_LOAD(&SPR_QMark, 1, 1, TILE_QMARKINDEX, 1, 0);
+	SHEET_LOAD(&SPR_Smoke, 7, 2*2, TILE_SMOKEINDEX, TRUE, 0,1,2,3,4,5,6);
+	SHEET_LOAD(&SPR_Dissipate, 4, 2*2, TILE_DISSIPINDEX, TRUE, 0,1,2,3);
+	SHEET_LOAD(&SPR_Gib, 4, 1, TILE_GIBINDEX, TRUE, 0,1,2,3);
+}
+
+
+void effects_update(void) {
+	for(uint8_t i = 0; i < MAX_DAMAGE; i++) {
+		if(!effDamage[i].ttl) continue;
+		effDamage[i].ttl--;
+		if(effDamage[i].ttl < 8) {
+			// Erase effect
+			for(uint16_t x = 0; x < 4; x++) {
+				for(uint16_t y = 0; y < 7; y++) {
+					dtiles[i][x][y] = dtiles[i][x][y+1];
+				}
+				dtiles[i][x][7] = 0;
+			}
+			dma_queue(DmaVRAM, (uintptr_t) dtiles[i][3-digitCount[i]], TILE_NUMBERINDEX*32 + i*4*32, 4*16, 2);
+		} else {
+			if(damageFollow[i].e) {
+				if(effDamage[i].ttl > 30) damageFollow[i].yoff -= effDamage[i].ttl & 1;
+				effDamage[i].x = (damageFollow[i].e->x >> CSF) + (damageFollow[i].xoff - 8);
+				effDamage[i].y = (damageFollow[i].e->y >> CSF) + (damageFollow[i].yoff - 8);
+			} else {
+				if(effDamage[i].ttl > 30) effDamage[i].y -= effDamage[i].ttl & 1;
+			}
+		}
+		sprite_pos(&effDamage[i].sprite,
+                   effDamage[i].x - camera.x_shifted,
+                   effDamage[i].y - camera.y_shifted);
+		vdp_sprite_add(&effDamage[i].sprite);
+	}
+
+	if(g_stage.scrolling_row) return;
+	
+	for(uint8_t i = 0; i < MAX_MISC; i++) {
+		if(!effMisc[i].ttl) continue;
+		effMisc[i].ttl--;
+		switch(effMisc[i].type) {
+			case EFF_SMOKE:
+			{
+				effMisc[i].x += effMisc[i].x_speed;
+				effMisc[i].y += effMisc[i].y_speed;
+				// Half assed animation
+				sprite_index(&effMisc[i].sprite,
+					TILE_SMOKEINDEX + 24 - ((effMisc[i].ttl >> 2) << 2));
+				sprite_pos(&effMisc[i].sprite,
+							effMisc[i].x - camera.x_shifted - 8,
+							effMisc[i].y - camera.y_shifted - 8);
+				vdp_sprite_add(&effMisc[i].sprite);
+			}
+			break;
+			case EFF_BONKL:
+			{
+				if(effMisc[i].ttl&1) {
+					if(effMisc[i].ttl > 15) {
+						effMisc[i].x--;
+						effMisc[i].y--;
+					}
+					sprite_pos(&effMisc[i].sprite,
+                               effMisc[i].x - camera.x_shifted - 4,
+                               effMisc[i].y - camera.y_shifted - 4);
+					vdp_sprite_add(&effMisc[i].sprite);
+				}
+			}
+			break;
+			case EFF_BONKR:
+			{
+				if(!(effMisc[i].ttl&1)) {
+					if(effMisc[i].ttl > 15) {
+						effMisc[i].x++;
+						effMisc[i].y--;
+					}
+					sprite_pos(&effMisc[i].sprite,
+                               effMisc[i].x - camera.x_shifted - 4,
+                               effMisc[i].y - camera.y_shifted - 4);
+					vdp_sprite_add(&effMisc[i].sprite);
+				}
+			}
+			break;
+			case EFF_ZZZ:
+			{
+				if(++effMisc[i].timer > TIME_8(25)) {
+					effMisc[i].timer = 0;
+					effMisc[i].sprite.attr++;
+				}
+				sprite_pos(&effMisc[i].sprite,
+                           effMisc[i].x - camera.x_shifted - 4,
+                           effMisc[i].y - camera.y_shifted - 4);
+				vdp_sprite_add(&effMisc[i].sprite);
+			}
+			break;
+			case EFF_BOOST8:
+			case EFF_BOOST2:
+			{
+				effMisc[i].x += effMisc[i].x_speed;
+				effMisc[i].y += effMisc[i].y_speed;
+				if(++effMisc[i].timer >= TIME_8(5)) {
+					effMisc[i].timer = 0;
+					effMisc[i].sprite.attr++;
+				}
+				sprite_pos(&effMisc[i].sprite,
+                           effMisc[i].x - camera.x_shifted - 4,
+                           effMisc[i].y - camera.y_shifted - 4);
+				vdp_sprite_add(&effMisc[i].sprite);
+			}
+			break;
+			case EFF_QMARK:
+			{
+				if(effMisc[i].ttl > TIME_8(20) && (effMisc[i].ttl & 1) == 0) {
+					effMisc[i].y -= 2;
+				}
+				sprite_pos(&effMisc[i].sprite,
+                           effMisc[i].x - camera.x_shifted - 4,
+                           effMisc[i].y - camera.y_shifted - 4);
+				vdp_sprite_add(&effMisc[i].sprite);
+			}
+			break;
+			case EFF_FANL:
+			case EFF_FANR:
+			{
+				effMisc[i].x += effMisc[i].x_speed;
+				sprite_pos(&effMisc[i].sprite,
+                           effMisc[i].x - camera.x_shifted - 4,
+                           effMisc[i].y - camera.y_shifted - 4);
+				vdp_sprite_add(&effMisc[i].sprite);
+			}
+			break;
+			case EFF_FANU:
+			case EFF_FAND:
+			{
+				effMisc[i].y += effMisc[i].y_speed;
+				sprite_pos(&effMisc[i].sprite,
+                           effMisc[i].x - camera.x_shifted - 4,
+                           effMisc[i].y - camera.y_shifted - 4);
+				vdp_sprite_add(&effMisc[i].sprite);
+			}
+			break;
+			case EFF_SPLASH:
+			{
+				if(++effMisc[i].timer >= 5) {
+					effMisc[i].timer = 0;
+					effMisc[i].y_speed++;
+				}
+				effMisc[i].x += effMisc[i].x_speed;
+				effMisc[i].y += effMisc[i].y_speed;
+				if(effMisc[i].ttl & 1) {
+					sprite_pos(&effMisc[i].sprite,
+                               effMisc[i].x - camera.x_shifted - 4,
+                               effMisc[i].y - camera.y_shifted - 4);
+					vdp_sprite_add(&effMisc[i].sprite);
+				}
+			}
+			break;
+            case EFF_PSTAR_HIT:
+            case EFF_MGUN_HIT:
+            {
+                if(effMisc[i].ttl && (effMisc[i].ttl & 3) == 0) {
+                    effMisc[i].sprite.attr += 4;
+                }
+                sprite_pos(&effMisc[i].sprite,
+                           effMisc[i].x - camera.x_shifted - 8,
+                           effMisc[i].y - camera.y_shifted - 8);
+                vdp_sprite_add(&effMisc[i].sprite);
+            }
+            break;
+		    case EFF_BUBB_POP:
+            {
+                if(effMisc[i].ttl == 4) effMisc[i].sprite.attr++;
+                sprite_pos(&effMisc[i].sprite,
+                           effMisc[i].x - camera.x_shifted - 4,
+                           effMisc[i].y - camera.y_shifted - 4);
+                vdp_sprite_add(&effMisc[i].sprite);
+            }
+            break;
+            case EFF_FIRETRAIL:
+            case EFF_SNAKETRAIL:
+            {
+                if((effMisc[i].ttl & 3) == 0) effMisc[i].sprite.attr++;
+                sprite_pos(&effMisc[i].sprite,
+                           effMisc[i].x - camera.x_shifted - 4,
+                           effMisc[i].y - camera.y_shifted - 4);
+                vdp_sprite_add(&effMisc[i].sprite);
+            }
+            break;
+			case EFF_DISSIPATE:
+			{
+				if((effMisc[i].ttl & 3) == 3) effMisc[i].sprite.attr += 4;
+                sprite_pos(&effMisc[i].sprite,
+                           effMisc[i].x - camera.x_shifted - 8,
+                           effMisc[i].y - camera.y_shifted - 8);
+                vdp_sprite_add(&effMisc[i].sprite);
+			}
+			break;
+			case EFF_GIB:
+			{
+				effMisc[i].x += effMisc[i].x_speed;
+				effMisc[i].y += effMisc[i].y_speed;
+				if((effMisc[i].ttl & 3) == 3) effMisc[i].sprite.attr++;
+                sprite_pos(&effMisc[i].sprite,
+                           effMisc[i].x - camera.x_shifted - 4,
+                           effMisc[i].y - camera.y_shifted - 4);
+                vdp_sprite_add(&effMisc[i].sprite);
+			}
+			break;
+		}
+	}
+}
+
+void effect_create_damage(int16_t num, Entity *follow, int16_t xoff, int16_t yoff) {
+	if(dqueued) return;
+	for(uint8_t i = 0; i < MAX_DAMAGE; i++) {
+		if(effDamage[i].ttl) continue;
+		// Negative numbers are red and show '-' (Damage)
+		// Positive are white and show '+' (Weapon energy)
+		uint8_t negative = (num < 0);
+		num = abs(num);
+		digitCount[i] = 0; // Number of digit tiles: 1, 2, or 3 after loop
+		// Create right to left, otherwise digits show up backwards
+		uint16_t tileIndex;
+		for(; num; digitCount[i]++) {
+			tileIndex = ((negative ? 11 : 0) + mod10[num]) << 3;
+			memcpy(dtiles[i][3 - digitCount[i]], &TS_Numbers[tileIndex], 32);
+			num = div10[num];
+		}
+		tileIndex = ((negative ? 11 : 0) + 10) * 8;
+		memcpy(dtiles[i][3 - digitCount[i]], &TS_Numbers[tileIndex], 32); // - or +
+		
+		if(follow) {
+			damageFollow[i].e = follow;
+			damageFollow[i].xoff = xoff;
+			damageFollow[i].yoff = yoff;
+			effDamage[i].x = (damageFollow[i].e->x >> CSF) + (xoff - 8);
+			effDamage[i].y = (damageFollow[i].e->y >> CSF) + (yoff);
+		} else {
+			damageFollow[i].e = NULL;
+			effDamage[i].x = xoff - 8;
+			effDamage[i].y = yoff;
+		}
+		effDamage[i].ttl = 60; // 1 second
+		effDamage[i].sprite = (Sprite) {
+			.size = SPRITE_SIZE(digitCount[i]+1, 1),
+			.attr = TILE_ATTR(PAL0, 1, 0, 0, TILE_NUMBERINDEX + (i<<2))
+		};
+		TILES_QUEUE(dtiles[i][3-digitCount[i]], TILE_NUMBERINDEX + (i<<2), digitCount[i]+1);
+		dqueued = TRUE;
+		break;
+	}
+}
+
+Effect* effect_create(uint8_t type, int16_t x, int16_t y, uint8_t only_one) {
+	uint16_t i;
+	for(i = 0; i < MAX_MISC; i++) {
+		if(effMisc[i].ttl) {
+			if(only_one && effMisc[i].type == type) break;
+			continue;
+		}
+		effMisc[i].type = type;
+		effMisc[i].x = x;
+		effMisc[i].y = y;
+		effMisc[i].x_speed = 0;
+		effMisc[i].y_speed = 0;
+		switch(type) {
+			case EFF_SMOKE:
+			{
+				switch(rand() & 7) {
+					case 0: effMisc[i].x_speed = 0;  effMisc[i].y_speed = 0; break;
+					case 1:	effMisc[i].x_speed = -1; effMisc[i].y_speed = 0; break;
+					case 2: effMisc[i].x_speed = -1; effMisc[i].y_speed = -1; break;
+					case 3: effMisc[i].x_speed = 0;  effMisc[i].y_speed = -1; break;
+					case 4: effMisc[i].x_speed = 1;  effMisc[i].y_speed = -1; break;
+					case 5:	effMisc[i].x_speed = 1;  effMisc[i].y_speed = 0; break;
+					case 6: effMisc[i].x_speed = 1;  effMisc[i].y_speed = 1; break;
+					case 7: effMisc[i].x_speed = 1;  effMisc[i].y_speed = 1; break;
+				}
+				effMisc[i].ttl = 24;
+				effMisc[i].sprite = (Sprite) {
+					.size = SPRITE_SIZE(2, 2),
+					.attr = TILE_ATTR(PAL1, 1, 0, 0, TILE_SMOKEINDEX)
+				};
+			}
+			break;
+			case EFF_BONKL: // Dots that appear when player bonks their head on the ceiling
+			case EFF_BONKR:
+			{
+				effMisc[i].ttl = 30;
+				effMisc[i].sprite = (Sprite) {
+					.size = SPRITE_SIZE(1, 1),
+					.attr = TILE_ATTR(PAL0,1,0,0,1)
+				};
+			}
+			break;
+			case EFF_ZZZ: // Zzz shown above sleeping NPCs like gunsmith, mimiga, etc
+			{
+				uint8_t sheet = NOSHEET;
+				SHEET_FIND(sheet, SHEET_ZZZ);
+				if(sheet == NOSHEET) break;
+				effMisc[i].timer = 0;
+				effMisc[i].ttl = TIME_8(100);
+				effMisc[i].sprite = (Sprite) {
+					.size = SPRITE_SIZE(1, 1),
+					.attr = TILE_ATTR(PAL0,1,0,0,sheets[sheet].index)
+				};
+			}
+			break;
+			case EFF_BOOST8: // Smoke that emits while using the booster
+			{
+				effMisc[i].y_speed = 1;
+			} // Fallthrough
+			case EFF_BOOST2:
+			{
+				effMisc[i].ttl = TIME_8(20);
+				effMisc[i].sprite = (Sprite) {
+					.size = SPRITE_SIZE(1, 1),
+					.attr = TILE_ATTR(PAL0,1,0,0,12)
+				};
+			}
+			break;
+			case EFF_QMARK:
+			{
+				effMisc[i].ttl = TIME_8(30);
+				effMisc[i].sprite = (Sprite) {
+					.size = SPRITE_SIZE(1, 1),
+					.attr = TILE_ATTR(PAL0,1,0,0,TILE_QMARKINDEX)
+				};
+			} 
+			break;
+			case EFF_FANL:
+			{
+				effMisc[i].x_speed = -(rand() & 3) - 1;
+				effMisc[i].ttl = TIME_8(20);
+				effMisc[i].sprite = (Sprite) {
+					.size = SPRITE_SIZE(1, 1),
+					.attr = TILE_ATTR(PAL0,1,0,0,1)
+				};
+			}
+			break;
+			case EFF_FANU:
+			{
+				effMisc[i].y_speed = -(rand() & 3) - 1;
+				effMisc[i].ttl = TIME_8(20);
+				effMisc[i].sprite = (Sprite) {
+					.size = SPRITE_SIZE(1, 1),
+					.attr = TILE_ATTR(PAL0,1,0,0,1)
+				};
+			}
+			break;
+			case EFF_FANR:
+			{
+				effMisc[i].x_speed = (rand() & 3) + 1;
+				effMisc[i].ttl = TIME_8(20);
+				effMisc[i].sprite = (Sprite) {
+					.size = SPRITE_SIZE(1, 1),
+					.attr = TILE_ATTR(PAL0,1,0,0,1)
+				};
+			}
+			break;
+			case EFF_FAND:
+			{
+				effMisc[i].y_speed = (rand() & 3) + 1;
+				effMisc[i].ttl = TIME_8(20);
+				effMisc[i].sprite = (Sprite) {
+					.size = SPRITE_SIZE(1, 1),
+					.attr = TILE_ATTR(PAL0,1,0,0,1)
+				};
+			}
+			break;
+			case EFF_SPLASH:
+			{
+				if(rand() & 1) {
+					effMisc[i].y_speed = -2;
+					effMisc[i].ttl = 18;
+				} else {
+					effMisc[i].y_speed = -3;
+					effMisc[i].ttl = 29;
+				}
+				effMisc[i].x_speed = (player.x_speed >> CSF) - 1 + (rand() & 3);
+				effMisc[i].sprite = (Sprite) {
+					.size = SPRITE_SIZE(1, 1),
+					.attr = TILE_ATTR(PAL0,1,0,0,1)
+				};
+			}
+			break;
+		    case EFF_PSTAR_HIT:
+            {
+                effMisc[i].ttl = 12;
+                uint8_t loc = 0;
+                SHEET_FIND(loc, SHEET_PSTAR);
+                effMisc[i].sprite = (Sprite) {
+                    .size = SPRITE_SIZE(2, 2),
+                    .attr = TILE_ATTR(PAL0,1,0,0,sheets[loc].index+8)
+                };
+            }
+            break;
+            case EFF_MGUN_HIT:
+            {
+                effMisc[i].ttl = 12;
+                uint8_t loc = 0;
+                SHEET_FIND(loc, SHEET_MGUN);
+                effMisc[i].sprite = (Sprite) {
+                    .size = SPRITE_SIZE(2, 2),
+                    .attr = TILE_ATTR(PAL0,1,0,0,sheets[loc].index+8)
+                };
+            }
+            break;
+            case EFF_BUBB_POP:
+            {
+                effMisc[i].ttl = 8;
+                uint8_t loc = 0;
+                SHEET_FIND(loc, SHEET_BUBB);
+                effMisc[i].sprite = (Sprite) {
+                        .size = SPRITE_SIZE(1, 1),
+                        .attr = TILE_ATTR(PAL0,1,0,0,sheets[loc].index+4)
+                };
+            }
+            break;
+            case EFF_FIRETRAIL:
+            {
+                effMisc[i].ttl = 12;
+                uint8_t loc = 0;
+                SHEET_FIND(loc, SHEET_FBALL);
+                effMisc[i].sprite = (Sprite) {
+                        .size = SPRITE_SIZE(1, 1),
+                        .attr = TILE_ATTR(PAL1,1,0,0,sheets[loc].index+12)
+                };
+            }
+            break;
+            case EFF_SNAKETRAIL:
+            {
+                effMisc[i].ttl = 12;
+                uint8_t loc = 0;
+                SHEET_FIND(loc, SHEET_SNAKE);
+                effMisc[i].sprite = (Sprite) {
+                    .size = SPRITE_SIZE(1, 1),
+                    .attr = TILE_ATTR(PAL1,1,0,0,sheets[loc].index+12)
+                };
+            }
+            break;
+			case EFF_DISSIPATE:
+            {
+                effMisc[i].ttl = 15;
+                effMisc[i].sprite = (Sprite) {
+                    .size = SPRITE_SIZE(2, 2),
+                    .attr = TILE_ATTR(PAL0,1,0,0,TILE_DISSIPINDEX)
+                };
+            }
+            break;
+			case EFF_GIB:
+            {
+				switch(rand() & 7) {
+					case 0: effMisc[i].x_speed = 0;  effMisc[i].y_speed = 0; break;
+					case 1:	effMisc[i].x_speed = -1; effMisc[i].y_speed = 0; break;
+					case 2: effMisc[i].x_speed = -1; effMisc[i].y_speed = -1; break;
+					case 3: effMisc[i].x_speed = 0;  effMisc[i].y_speed = -1; break;
+					case 4: effMisc[i].x_speed = 1;  effMisc[i].y_speed = -1; break;
+					case 5:	effMisc[i].x_speed = 1;  effMisc[i].y_speed = 0; break;
+					case 6: effMisc[i].x_speed = 1;  effMisc[i].y_speed = 1; break;
+					case 7: effMisc[i].x_speed = 1;  effMisc[i].y_speed = 1; break;
+				}
+                effMisc[i].ttl = 15;
+                effMisc[i].sprite = (Sprite) {
+                    .size = SPRITE_SIZE(2, 2),
+                    .attr = TILE_ATTR(PAL1,1,0,0,TILE_GIBINDEX)
+                };
+            }
+            break;
+		}
+		break;
+	}
+	if(i < MAX_MISC) {
+		return &effMisc[i];
+	} else {
+		return NULL;
+	}
+}
+
+// Fading
+
+#define hval (1<<15) | TILE_FADEINDEX
+#define lval TILE_FADEINDEX
+static const uint16_t winmap[40] = { 
+	hval,hval,hval,hval,hval,hval,hval,hval,hval,hval,
+	hval,hval,hval,hval,hval,hval,hval,hval,hval,hval,
+	hval,hval,hval,hval,hval,hval,hval,hval,hval,hval,
+	hval,hval,hval,hval,hval,hval,hval,hval,hval,hval,
+};
+static const uint16_t winmap_intro[40] = { 
+	lval,lval,lval,lval,lval,lval,lval,lval,lval,lval,
+	lval,lval,lval,lval,lval,lval,lval,lval,lval,lval,
+	lval,lval,lval,lval,lval,lval,lval,lval,lval,lval,
+	lval,lval,lval,lval,lval,lval,lval,lval,lval,lval,
+};
+static const uint32_t tblack[8] = {
+	0x11111111,0x11111111,0x11111111,0x11111111,
+	0x11111111,0x11111111,0x11111111,0x11111111,
+};
+
+static void fade_setup(Sprite *spr0, Sprite *spr1, Sprite *spr2, uint8_t dir, uint8_t fadein) {
+	// Fill window plane
+	for(uint16_t y = 0; y < ScreenHeight / 8; y++) {
+		if(gamemode == GM_CREDITS || (gamemode == GM_INTRO && y < 8)) {
+			// low priority at top of intro, as not to cover "Studio Pixel" message
+			dma_now(DmaVRAM, (uintptr_t) winmap_intro, VDP_PLANE_W + y*128, 40, 2);
+		} else {
+			dma_now(DmaVRAM, (uintptr_t) winmap, VDP_PLANE_W + y*128, 40, 2);
+		}
+	}
+	// Setup tiles for sprites+window wipe
+	if(gamemode == GM_CREDITS) {
+		SHEET_LOAD(&SPR_FadeV, 2, 4*4, TILE_HUDINDEX, TRUE, 0,1);
+		SHEET_LOAD(&SPR_FadeV, 1, 4*4, TILE_NUMBERINDEX, TRUE, 2);
+	} else {
+		SHEET_LOAD(&SPR_Fade, 2, 4*4, TILE_HUDINDEX, TRUE, 0,1);
+		SHEET_LOAD(&SPR_Fade, 1, 4*4, TILE_NUMBERINDEX, TRUE, 2);
+	}
+	
+	dma_now(DmaVRAM, (uintptr_t) tblack, TILE_FADEINDEX*TILE_SIZE, TILE_SIZE/2, 2);
+	// Setup sprites
+	uint16_t sprnum = (gamemode == GM_CREDITS) ? 5 : pal_mode ? 8 : 7;
+	for(uint16_t i = 0; i < sprnum; i++) {
+		if(gamemode == GM_CREDITS) {
+			spr0[i].x = 0x80 + 160 + i * 32;
+			spr1[i].x = 0x80 + 160 + i * 32;
+			spr2[i].x = 0x80 + 160 + i * 32;
+			if(fadein) {
+				if(dir) { // Start from bottom
+					spr0[i].y = 0x80 + ScreenHeight + 64;
+					spr1[i].y = 0x80 + ScreenHeight + 32;
+					spr2[i].y = 0x80 + ScreenHeight + 0;
+				} else { // Start from top
+					spr0[i].y = 0x80 - 96;
+					spr1[i].y = 0x80 - 64;
+					spr2[i].y = 0x80 - 32;
+				}
+			} else {
+				if(dir) { // Start from bottom
+					spr0[i].y = 0x80 + ScreenHeight + 0;
+					spr1[i].y = 0x80 + ScreenHeight + 32;
+					spr2[i].y = 0x80 + ScreenHeight + 64;
+				} else { // Start from top
+					spr0[i].y = 0x80 - 32;
+					spr1[i].y = 0x80 - 64;
+					spr2[i].y = 0x80 - 96;
+				}
+			}
+		} else {
+			spr0[i].y = 0x80 + i * 32;
+			spr1[i].y = 0x80 + i * 32;
+			spr2[i].y = 0x80 + i * 32;
+			if(fadein) {
+				if(dir) { // Start from right
+					spr0[i].x = 0x80 + ScreenWidth + 64;
+					spr1[i].x = 0x80 + ScreenWidth + 32;
+					spr2[i].x = 0x80 + ScreenWidth + 0;
+				} else { // Start from left
+					spr0[i].x = 0x80 - 96;
+					spr1[i].x = 0x80 - 64;
+					spr2[i].x = 0x80 - 32;
+				}
+			} else {
+				if(dir) { // Start from right
+					spr0[i].x = 0x80 + ScreenWidth + 0;
+					spr1[i].x = 0x80 + ScreenWidth + 32;
+					spr2[i].x = 0x80 + ScreenWidth + 64;
+				} else { // Start from left
+					spr0[i].x = 0x80 - 32;
+					spr1[i].x = 0x80 - 64;
+					spr2[i].x = 0x80 - 96;
+				}
+			}
+		}
+		spr0[i].size = SPRITE_SIZE(4,4);
+		spr1[i].size = SPRITE_SIZE(4,4);
+		spr2[i].size = SPRITE_SIZE(4,4);
+		// Low pri for intro message
+		const uint16_t pri = (gamemode == GM_INTRO && i < 2) ? 0 : (gamemode == GM_CREDITS) ? 0 : 1;
+		spr0[i].attr = TILE_ATTR(PAL0,pri,0,(fadein?dir:!dir), TILE_HUDINDEX);
+		spr1[i].attr = TILE_ATTR(PAL0,pri,0,(fadein?dir:!dir), TILE_HUDINDEX+16);
+		spr2[i].attr = TILE_ATTR(PAL0,pri,0,(fadein?dir:!dir), TILE_NUMBERINDEX);
+	}
+}
+
+void do_fadeout_wipe(uint8_t dir) {
+	Sprite *spr0 = (Sprite*) dtiles[0];
+	Sprite *spr1 = (Sprite*) dtiles[1];
+	Sprite *spr2 = (Sprite*) dtiles[2];
+	fade_setup(spr0, spr1, spr2, dir, FALSE);
+	// Fade loop
+	for(uint16_t f = 0; f < ScreenWidth / 16 + 6; f++) {
+		// Update Sprites
+		for(uint16_t i = 0; i < (pal_mode ? 8 : 7); i++) {
+			spr0[i].x += dir ? -16 : 16;
+			spr1[i].x += dir ? -16 : 16;
+			spr2[i].x += dir ? -16 : 16;
+		}
+		vdp_sprites_add(spr0, pal_mode ? 8 : 7);
+		vdp_sprites_add(spr1, pal_mode ? 8 : 7);
+		vdp_sprites_add(spr2, pal_mode ? 8 : 7);
+		player_draw();
+		entities_draw();
+		sys_wait_vblank();
+		// Update window plane
+		if(f > 5) {
+			const uint8_t x = dir ? (20 - (f-5)) | 0x80 : f-5;
+			vdp_set_window(x, 0);
+		}
+		ready = TRUE;
+		aftervsync();
+	}
+	vdp_colors(0, PAL_FadeOut, 64);
+	vdp_set_window(0, 0);
+}
+
+void start_fadein_wipe(uint8_t dir) {
+	// I guess it would be better to use a union or "work" structs, this is pretty dirty cast
+	Sprite *spr0 = (Sprite*) dtiles[0];
+	Sprite *spr1 = (Sprite*) dtiles[1];
+	Sprite *spr2 = (Sprite*) dtiles[2];
+	fade_setup(spr0, spr1, spr2, dir, TRUE);
+	wipeFadeTimer = (gamemode == GM_CREDITS) ? (ScreenHeight / 16 + 6) : (ScreenWidth / 16 + 6);
+	wipeFadeDir = dir;
+	// Cover screen with window (black) and write target palette now
+	sys_wait_vblank(); // Delay until vblank so we don't get the CRAM dots
+	vdp_set_window(20, 0);
+	vdp_colors_apply_next_now();
+}
+
+void update_fadein_wipe(void) {
+	wipeFadeTimer--;
+	if(wipeFadeTimer >= 0) {
+		Sprite *spr0 = (Sprite*) dtiles[0];
+		Sprite *spr1 = (Sprite*) dtiles[1];
+		Sprite *spr2 = (Sprite*) dtiles[2];
+		// Update Sprites
+		uint16_t sprnum = (gamemode == GM_CREDITS) ? 5 : pal_mode ? 8 : 7;
+		if(gamemode == GM_CREDITS) {
+			for(uint16_t i = 0; i < sprnum; i++) {
+				spr0[i].y += wipeFadeDir ? -16 : 16;
+				spr1[i].y += wipeFadeDir ? -16 : 16;
+				spr2[i].y += wipeFadeDir ? -16 : 16;
+			}
+		} else {
+			for(uint16_t i = 0; i < sprnum; i++) {
+				spr0[i].x += wipeFadeDir ? -16 : 16;
+				spr1[i].x += wipeFadeDir ? -16 : 16;
+				spr2[i].x += wipeFadeDir ? -16 : 16;
+			}
+		}
+		vdp_sprites_add(spr0, sprnum);
+		vdp_sprites_add(spr1, sprnum);
+		vdp_sprites_add(spr2, sprnum);
+		// Update window plane
+		if(wipeFadeTimer > 5) {
+			if(gamemode == GM_CREDITS) {
+				const uint8_t y = (wipeFadeTimer-5)*2;
+				vdp_set_window(0, y);
+			} else {
+				const uint8_t x = wipeFadeDir ? (wipeFadeTimer-5) : (20 - (wipeFadeTimer-5)) | 0x80;
+				vdp_set_window(x, 0);
+			}
+		} else {
+			vdp_set_window(0, 0);
+		}
+	} else {
+		// After the fade is done, need to restore HUD tiles we clobbered
+		if(gamemode == GM_GAME) hud_force_redraw();
+	}
+}
+
+// Fade in/out, half screen vertical for credits
+
+void start_credits_fadeout_wipe(uint8_t dir) {
+	Sprite *spr0 = (Sprite*) dtiles[0];
+	Sprite *spr1 = (Sprite*) dtiles[1];
+	Sprite *spr2 = (Sprite*) dtiles[2];
+	fade_setup(spr0, spr1, spr2, dir, FALSE);
+	wipeFadeOutTimer = ScreenHeight / 16 + 6;
+	wipeFadeDir = dir;
+}
+
+void update_credits_fadeout_wipe(void) {
+	wipeFadeOutTimer--;
+	if(wipeFadeOutTimer >= 0) {
+		Sprite *spr0 = (Sprite*) dtiles[0];
+		Sprite *spr1 = (Sprite*) dtiles[1];
+		Sprite *spr2 = (Sprite*) dtiles[2];
+		// Update Sprites
+		for(uint16_t i = 0; i < 5; i++) {
+			spr0[i].y -= 16;
+			spr1[i].y -= 16;
+			spr2[i].y -= 16;
+		}
+		vdp_sprites_add(spr0, 5);
+		vdp_sprites_add(spr1, 5);
+		vdp_sprites_add(spr2, 5);
+		// Update window plane
+		if(wipeFadeOutTimer <= ScreenHeight / 16) {
+			const uint8_t y = (wipeFadeOutTimer*2) | 0x80;
+			vdp_set_window(0, y);
+		}
+	}
+}
+
+// Sprite clipping
+
+uint8_t start_clip_out(uint16_t vram_index, uint8_t speed, uint8_t width, uint8_t height) {
+	uint8_t ind = s_clipout[0].y_remain ? 1 : 0;
+
+	ClipOut *clip = &s_clipout[ind];
+	clip->addr = vram_index * TILE_SIZE;
+	clip->line_len = width * 4; 			// 4 bytes for 8 pixels
+	clip->spr_height = min(height * 8, 32); // Subsprite (max 32x32) height
+	clip->spr_remain = clip->spr_height;	// Sprite's remaining lines
+	clip->y_remain = height * 8;			// Total remaining lines
+	clip->speed = speed;
+	clip->timer = 1; // Clip first line right away on next update call
+
+	return ind;
+}
+
+uint8_t update_clip_out(uint8_t ind) {
+	ClipOut *clip = &s_clipout[ind];
+
+	if(clip->y_remain) {
+		if(--clip->timer) return TRUE;
+
+		uint8_t num_words = clip->line_len / 4;
+		uint8_t inc = clip->spr_height / 8 * TILE_SIZE;
+		uint16_t addr = clip->addr;
+		while(num_words) { // Iterates sub-sprites horizontally
+			uint8_t part_words = min(num_words, 4);
+			dma_queue(DmaVRAM, (uintptr_t) BlankData, addr, part_words, inc);
+			dma_queue(DmaVRAM, (uintptr_t) BlankData, addr+2, part_words, inc);
+			addr += clip->spr_height * part_words * 4;
+			num_words -= part_words;
+		}
+		
+		clip->addr += 4;
+		clip->timer = clip->speed;
+
+		if(--clip->spr_remain == 0) {
+			// addr is already at the end of the first column above, so skip that one (-4)
+			clip->addr += (clip->line_len - 4) * clip->spr_height;
+			clip->y_remain -= clip->spr_height;
+			if(clip->y_remain) {
+				clip->spr_height = min(clip->y_remain, 32);
+				clip->spr_remain = clip->spr_height;
+			} else {
+				return FALSE;
+			}
+		}
+
+		return TRUE;
+	}
+	return FALSE;
+}
+
+void start_clip_in(const uint32_t *tile_dat, uint16_t vram_index, uint8_t speed, uint8_t width, uint8_t height) {
+	s_clipin.tile_dat = tile_dat;
+	s_clipin.to_addr = vram_index * TILE_SIZE;
+	s_clipin.line_len = width * 4;
+	s_clipin.spr_height = min(height * 8, 32);
+	s_clipin.spr_remain = s_clipin.spr_height;
+	s_clipin.y_remain = height * 8;
+	s_clipin.speed = speed;
+	s_clipin.timer = 2;
+	// Erase whatever the sprite tiles are now before beginning the clip in
+	uint16_t num_words = width * height * 4;
+	uint16_t addr = s_clipin.to_addr;
+	while(num_words) {
+		uint16_t part_words = min(num_words, 128);
+		dma_queue(DmaVRAM, (uintptr_t) BlankData, addr, part_words, 2);
+		addr += part_words * 2;
+		num_words -= part_words;
+	}
+}
+
+uint8_t update_clip_in(void) {
+	if(s_clipin.y_remain) {
+		if(--s_clipin.timer) return TRUE;
+
+		uint8_t num_tile = s_clipin.line_len / 4;
+		uint8_t sub_row = s_clipin.spr_height - s_clipin.spr_remain; //s_clipin.y_remain;
+		uint8_t col_size = s_clipin.spr_height * TILE_SIZE / 8;
+		uint16_t spr_addr = s_clipin.to_addr;
+		uint16_t row_off = 0;
+		while(num_tile) {
+			uint8_t part_tile = min(num_tile, 4);
+			for(uint8_t x = 0; x < part_tile; x++) {
+				uint32_t row = s_clipin.tile_dat[row_off + x * col_size / 4 + sub_row];
+				uint16_t to_addr = spr_addr + x * col_size;
+				dma_now(DmaVRAM, (uintptr_t) &row, to_addr, 2, 2);
+			}
+			spr_addr += part_tile * col_size;
+			row_off += part_tile * col_size / 4;
+			num_tile -= part_tile;
+		}
+		
+		s_clipin.to_addr += 4;
+		s_clipin.timer = s_clipin.speed;
+
+		if(--s_clipin.spr_remain == 0) {
+			// addr is already at the end of the first column above, so skip that one (-4)
+			s_clipin.to_addr += (s_clipin.line_len - 4) * s_clipin.spr_height;
+			s_clipin.tile_dat += s_clipin.line_len * s_clipin.spr_height / 4; // Move source too
+			s_clipin.y_remain -= s_clipin.spr_height;
+			if(s_clipin.y_remain) {
+				s_clipin.spr_height = min(s_clipin.y_remain, 32);
+				s_clipin.spr_remain = s_clipin.spr_height;
+			} else {
+				return FALSE;
+			}
+		}
+		
+		return TRUE;
+	}
+	return FALSE;
+}
+/* non-metasprite version, can't use because the Doctor is a big guy
+void start_clip_in_old(const uint32_t *tile_dat, uint16_t vram_index, uint8_t speed, uint8_t width, uint8_t height) {
+	s_clipin.tile_dat = tile_dat;
+	s_clipin.to_addr = vram_index * TILE_SIZE;
+	s_clipin.line_len = width * 4;
+	s_clipin.spr_height = height;
+	s_clipin.y_remain = height * 8;
+	s_clipin.speed = speed;
+	s_clipin.timer = 2;
+	// Erase whatever the sprite tiles are now before beginning the clip in
+	dma_queue_rom(DmaVRAM, (uintptr_t) BlankData, s_clipin.to_addr, width * height * 16, 2);
+}
+
+uint8_t update_clip_in_old(void) {
+	if(s_clipin.y_remain) {
+		if(--s_clipin.timer) return TRUE;
+
+		const uint8_t num_tile = s_clipin.line_len / 4;
+		const uint8_t sub_row = s_clipin.spr_height * 8 - s_clipin.y_remain;
+		const uint8_t col_size = s_clipin.spr_height * TILE_SIZE;
+
+		for(uint8_t x = 0; x < num_tile; x++) {
+			uint32_t row = s_clipin.tile_dat[x * col_size / 4 + sub_row];
+			uint16_t to_addr = s_clipin.to_addr + x * col_size;
+			dma_now(DmaVRAM, (uintptr_t) &row, to_addr, 2, 2);
+		}
+
+		s_clipin.to_addr += 4;
+		s_clipin.y_remain--;
+		s_clipin.timer = s_clipin.speed;
+		
+		return TRUE;
+	}
+	return FALSE;
+}
+*/
